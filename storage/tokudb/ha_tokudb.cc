@@ -6391,13 +6391,14 @@ enum row_type ha_tokudb::get_row_type(void) const {
 #endif
 
 static int create_sub_table(
-    const char *table_name, 
-    DBT* row_descriptor, 
-    DB_TXN* txn, 
-    uint32_t block_size, 
+    const char *table_name,
+    DBT* row_descriptor,
+    DB_TXN* txn,
+    uint32_t block_size,
     uint32_t read_block_size,
     toku_compression_method compression_method,
-    bool is_hot_index
+    bool is_hot_index,
+    uint32_t leaf_rebalance_mode
     ) 
 {
     TOKUDB_DBUG_ENTER("");
@@ -6432,6 +6433,13 @@ static int create_sub_table(
     if (error != 0) {
         DBUG_PRINT("error", ("Got error: %d when setting compression type %u for table '%s'", error, compression_method, table_name));
         goto exit;
+    }
+    if (leaf_rebalance_mode != 0) {
+        error = file->set_leaf_rebalance_mode(file, leaf_rebalance_mode);
+        if (error != 0) {
+            DBUG_PRINT("error", ("Got error: %d when setting leaf_rebalance_mode %u for table '%s'", error, leaf_rebalance_mode, table_name));
+            goto exit;
+        }
     }
 
     create_flags = DB_THREAD | DB_CREATE | DB_EXCL | (is_hot_index ? DB_IS_HOT_INDEX : 0);    
@@ -6635,6 +6643,7 @@ int ha_tokudb::create_secondary_dictionary(
     uint hpk= (form->s->primary_key >= MAX_KEY) ? TOKUDB_HIDDEN_PRIMARY_KEY_LENGTH : 0;
     uint32_t block_size;
     uint32_t read_block_size;
+    uint32_t leaf_rebalance_mode;
     THD* thd = ha_thd();
 
     memset(&row_descriptor, 0, sizeof(row_descriptor));
@@ -6673,8 +6682,11 @@ int ha_tokudb::create_secondary_dictionary(
 
     block_size = get_tokudb_block_size(thd);
     read_block_size = get_tokudb_read_block_size(thd);
+    leaf_rebalance_mode = get_tokudb_leaf_rebalance_mode(thd);
 
-    error = create_sub_table(newname, &row_descriptor, txn, block_size, read_block_size, compression_method, is_hot_index);
+    error = create_sub_table(newname, &row_descriptor, txn, block_size,
+                             read_block_size, compression_method, is_hot_index,
+                             leaf_rebalance_mode);
 cleanup:    
     tokudb_my_free(newname);
     tokudb_my_free(row_desc_buff);
@@ -6729,6 +6741,7 @@ int ha_tokudb::create_main_dictionary(const char* name, TABLE* form, DB_TXN* txn
     uint hpk= (form->s->primary_key >= MAX_KEY) ? TOKUDB_HIDDEN_PRIMARY_KEY_LENGTH : 0;
     uint32_t block_size;
     uint32_t read_block_size;
+    uint32_t leaf_rebalance_mode;
     THD* thd = ha_thd();
 
     memset(&row_descriptor, 0, sizeof(row_descriptor));
@@ -6763,9 +6776,12 @@ int ha_tokudb::create_main_dictionary(const char* name, TABLE* form, DB_TXN* txn
 
     block_size = get_tokudb_block_size(thd);
     read_block_size = get_tokudb_read_block_size(thd);
+    leaf_rebalance_mode = get_tokudb_leaf_rebalance_mode(thd);
 
     /* Create the main table that will hold the real rows */
-    error = create_sub_table(newname, &row_descriptor, txn, block_size, read_block_size, compression_method, false);
+    error = create_sub_table(newname, &row_descriptor, txn, block_size,
+                             read_block_size, compression_method, false,
+                             leaf_rebalance_mode);
 cleanup:    
     tokudb_my_free(newname);
     tokudb_my_free(row_desc_buff);
