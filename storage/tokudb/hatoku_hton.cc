@@ -1456,6 +1456,7 @@ static struct st_mysql_sys_var *tokudb_system_variables[] = {
     MYSQL_SYSVAR(read_block_size),
     MYSQL_SYSVAR(read_buf_size),
     MYSQL_SYSVAR(fanout),
+    MYSQL_SYSVAR(leaf_rebalance_mode),
     MYSQL_SYSVAR(row_format),
     MYSQL_SYSVAR(directio),
     MYSQL_SYSVAR(checkpoint_on_flush_logs),

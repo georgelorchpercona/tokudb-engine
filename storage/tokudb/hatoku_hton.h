@@ -385,6 +385,22 @@ static uint get_tokudb_fanout(THD* thd) {
     return THDVAR(thd, fanout);
 }
 
+static MYSQL_THDVAR_UINT(leaf_rebalance_mode,
+    0,
+    "fractal tree leaf rebalance mode",
+    NULL, 
+    NULL, 
+    0, // default
+    0, // min
+    1, // max
+    1  // blocksize???
+);
+
+static uint get_tokudb_leaf_rebalance_mode(THD* thd) {
+    return THDVAR(thd, leaf_rebalance_mode);
+}
+
+
 static MYSQL_THDVAR_UINT(analyze_time, 0, "analyze time (seconds)", NULL /*check*/, NULL /*update*/, 5 /*default*/, 0 /*min*/, ~0U /*max*/, 1 /*blocksize*/);
 
 static MYSQL_THDVAR_DOUBLE(analyze_delete_fraction, 0, "fraction of rows allowed to be deleted", NULL /*check*/, NULL /*update*/, 1.0 /*def*/, 0 /*min*/, 1.0 /*max*/, 1);
