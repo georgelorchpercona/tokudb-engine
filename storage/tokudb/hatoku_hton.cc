@@ -220,6 +220,7 @@ void toku_hton_update_primary_key_bytes_inserted(uint64_t row_size) {
 static void tokudb_lock_timeout_callback(DB *db, uint64_t requesting_txnid, const DBT *left_key, const DBT *right_key, uint64_t blocking_txnid);
 static ulong tokudb_cleaner_period;
 static ulong tokudb_cleaner_iterations;
+static ulong tokudb_cleaner_window;
 
 #define ASSERT_MSGLEN 1024
 
@@ -555,6 +556,8 @@ static int tokudb_init_func(void *p) {
     r = db_env->cleaner_set_period(db_env, tokudb_cleaner_period);
     assert(r == 0);
     r = db_env->cleaner_set_iterations(db_env, tokudb_cleaner_iterations);
+    assert(r == 0);
+    r = db_env->cleaner_set_window(db_env, tokudb_cleaner_window);
     assert(r == 0);
 
     r = db_env->set_lock_timeout(db_env, DEFAULT_TOKUDB_LOCK_TIMEOUT, tokudb_get_lock_wait_time_callback);
@@ -1375,6 +1378,20 @@ static MYSQL_SYSVAR_ULONG(cleaner_iterations, tokudb_cleaner_iterations,
     NULL, tokudb_cleaner_iterations_update, DEFAULT_CLEANER_ITERATIONS,
     0, ~0UL, 0);
 
+static void tokudb_cleaner_window_update(THD * thd, struct st_mysql_sys_var * sys_var, void * var, const void * save) {
+    ulong * cleaner_window = (ulong *) var;
+    *cleaner_window = *(const ulonglong *) save;
+    int r = db_env->cleaner_set_window(db_env, *cleaner_window);
+    assert(r == 0);
+}
+
+#define DEFAULT_CLEANER_WINDOW 8
+
+static MYSQL_SYSVAR_ULONG(cleaner_window, tokudb_cleaner_window,
+    0, "TokuDB cleaner_window", 
+    NULL, tokudb_cleaner_window_update, DEFAULT_CLEANER_WINDOW,
+    0, ~0UL, 0);
+
 static void tokudb_checkpointing_period_update(THD * thd, struct st_mysql_sys_var * sys_var, void * var, const void * save) {
     uint * checkpointing_period = (uint *) var;
     *checkpointing_period = *(const ulonglong *) save;
@@ -1437,6 +1454,7 @@ static struct st_mysql_sys_var *tokudb_system_variables[] = {
     MYSQL_SYSVAR(lock_timeout),
     MYSQL_SYSVAR(cleaner_period),
     MYSQL_SYSVAR(cleaner_iterations),
+    MYSQL_SYSVAR(cleaner_window),
     MYSQL_SYSVAR(pk_insert_mode),
     MYSQL_SYSVAR(load_save_space),
     MYSQL_SYSVAR(disable_slow_alter),
