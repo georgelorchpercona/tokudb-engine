@@ -100,11 +100,12 @@ extern DB_ENV *db_env;
 enum srv_row_format_enum {
     SRV_ROW_FORMAT_UNCOMPRESSED = 0,
     SRV_ROW_FORMAT_ZLIB = 1,
-    SRV_ROW_FORMAT_QUICKLZ = 2,
-    SRV_ROW_FORMAT_LZMA = 3,
-    SRV_ROW_FORMAT_FAST = 4,
-    SRV_ROW_FORMAT_SMALL = 5,
-    SRV_ROW_FORMAT_DEFAULT = 6
+    SRV_ROW_FORMAT_SNAPPY = 2,
+    SRV_ROW_FORMAT_QUICKLZ = 3,
+    SRV_ROW_FORMAT_LZMA = 4,
+    SRV_ROW_FORMAT_FAST = 5,
+    SRV_ROW_FORMAT_SMALL = 6,
+    SRV_ROW_FORMAT_DEFAULT = 7
 };
 typedef enum srv_row_format_enum srv_row_format_t;
 
@@ -115,6 +116,8 @@ static inline srv_row_format_t toku_compression_method_to_row_format(toku_compre
     case TOKU_ZLIB_WITHOUT_CHECKSUM_METHOD:
     case TOKU_ZLIB_METHOD:
         return SRV_ROW_FORMAT_ZLIB;
+    case TOKU_SNAPPY_METHOD:
+        return SRV_ROW_FORMAT_SNAPPY;
     case TOKU_QUICKLZ_METHOD:
         return SRV_ROW_FORMAT_QUICKLZ;
     case TOKU_LZMA_METHOD:
@@ -137,6 +140,8 @@ static inline toku_compression_method row_format_to_toku_compression_method(srv_
     case SRV_ROW_FORMAT_QUICKLZ:
     case SRV_ROW_FORMAT_FAST:
         return TOKU_QUICKLZ_METHOD;
+    case SRV_ROW_FORMAT_SNAPPY:
+        return TOKU_SNAPPY_METHOD;
     case SRV_ROW_FORMAT_ZLIB:
     case SRV_ROW_FORMAT_DEFAULT:
         return TOKU_ZLIB_WITHOUT_CHECKSUM_METHOD;
@@ -155,6 +160,8 @@ static inline enum row_type row_format_to_row_type(srv_row_format_t row_format) 
         return ROW_TYPE_TOKU_UNCOMPRESSED;
     case SRV_ROW_FORMAT_ZLIB:
         return ROW_TYPE_TOKU_ZLIB;
+    case SRV_ROW_FORMAT_SNAPPY:
+        return ROW_TYPE_TOKU_SNAPPY;
     case SRV_ROW_FORMAT_QUICKLZ:
         return ROW_TYPE_TOKU_QUICKLZ;
     case SRV_ROW_FORMAT_LZMA:
@@ -177,6 +184,8 @@ static inline srv_row_format_t row_type_to_row_format(enum row_type type) {
         return SRV_ROW_FORMAT_UNCOMPRESSED;
     case ROW_TYPE_TOKU_ZLIB:
         return SRV_ROW_FORMAT_ZLIB;
+    case ROW_TYPE_TOKU_SNAPPY:
+        return SRV_ROW_FORMAT_SNAPPY;
     case ROW_TYPE_TOKU_QUICKLZ:
         return SRV_ROW_FORMAT_QUICKLZ;
     case ROW_TYPE_TOKU_LZMA:
@@ -404,6 +413,7 @@ static MYSQL_THDVAR_BOOL(checkpoint_lock,
 static const char *tokudb_row_format_names[] = {
     "tokudb_uncompressed",
     "tokudb_zlib",
+    "tokudb_snappy",
     "tokudb_quicklz",
     "tokudb_lzma",
     "tokudb_fast",
@@ -421,8 +431,8 @@ static TYPELIB tokudb_row_format_typelib = {
 
 static MYSQL_THDVAR_ENUM(row_format, PLUGIN_VAR_OPCMDARG,
                          "Specifies the compression method for a table during this session. "
-                         "Possible values are TOKUDB_UNCOMPRESSED, TOKUDB_ZLIB, TOKUDB_QUICKLZ, "
-                         "TOKUDB_LZMA, TOKUDB_FAST, TOKUDB_SMALL and TOKUDB_DEFAULT",
+                         "Possible values are TOKUDB_UNCOMPRESSED, TOKUDB_ZLIB, TOKUDB_SNAPPY, "
+                         "TOKUDB_QUICKLZ, TOKUDB_LZMA, TOKUDB_FAST, TOKUDB_SMALL and TOKUDB_DEFAULT",
                          NULL, NULL, SRV_ROW_FORMAT_ZLIB, &tokudb_row_format_typelib);
 
 static inline srv_row_format_t get_row_format(THD *thd) {
