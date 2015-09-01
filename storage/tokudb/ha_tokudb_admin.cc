@@ -23,6 +23,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 
 #ident "Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved."
 
+#include "ha_tokudb_sysvars.h"
 #include "toku_time.h"
 
 struct analyze_progress_extra {
@@ -42,7 +43,7 @@ static int analyze_progress(void *v_extra, uint64_t rows) {
         return ER_ABORTING_CONNECTION;
 
     time_t t_now = time(0);
-    time_t t_limit = THDVAR(thd, analyze_time);
+    time_t t_limit = get_tokudb_analyze_time(thd);
     time_t t_start = extra->t_start;
     if (t_limit > 0 && t_now - t_start > t_limit)
         return ETIME;
@@ -103,7 +104,7 @@ int ha_tokudb::analyze(THD *thd, HA_CHECK_OPT *check_opt) {
             if (error != 0 && rows == 0 && deleted_rows > 0) {
                 result = HA_ADMIN_FAILED;
             }
-            double f = THDVAR(thd, analyze_delete_fraction);
+            double f = get_tokudb_analyze_delete_fraction(thd);
             if (result == HA_ADMIN_FAILED || (double) deleted_rows > f * (rows + deleted_rows)) {
                 char name[256]; int namelen;
                 namelen = snprintf(name, sizeof name, "%.*s.%.*s.%s",
@@ -208,7 +209,7 @@ int ha_tokudb::do_optimize(THD *thd) {
     // for each DB, run optimize and hot_optimize
     for (uint i = 0; i < curr_num_DBs; i++) {
         // only optimize the index if it matches the optimize_index_name session variable
-        const char *optimize_index_name = THDVAR(thd, optimize_index_name);
+        const char *optimize_index_name = get_tokudb_optimize_index_name(thd);
         if (optimize_index_name) {
             const char *this_index_name = i >= table_share->keys ? "primary" : table_share->key_info[i].name;
             if (strcasecmp(optimize_index_name, this_index_name) != 0) {
@@ -229,9 +230,9 @@ int ha_tokudb::do_optimize(THD *thd) {
         hc.ha = this;
         hc.current_table = i;
         hc.num_tables = curr_num_DBs;
-        hc.progress_limit = THDVAR(thd, optimize_index_fraction);
+        hc.progress_limit = get_tokudb_optimize_index_fraction(thd);
         hc.progress_last_time = toku_current_time_microsec();
-        hc.throttle = THDVAR(thd, optimize_throttle);
+        hc.throttle = get_tokudb_optimize_throttle(thd);
         uint64_t loops_run;
         error = db->hot_optimize(db, NULL, NULL, hot_optimize_progress_fun, &hc, &loops_run);
         if (error) {

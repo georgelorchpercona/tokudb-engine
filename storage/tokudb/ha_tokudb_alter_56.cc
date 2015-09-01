@@ -167,7 +167,7 @@ static ulong fix_handler_flags(THD *thd, TABLE *table, TABLE *altered_table, Alt
     // column addition later.
     if (handler_flags & (Alter_inplace_info::ADD_COLUMN + Alter_inplace_info::DROP_COLUMN)) {
         if (handler_flags & (Alter_inplace_info::ADD_INDEX + Alter_inplace_info::DROP_INDEX)) {
-            if (tables_have_same_keys(table, altered_table, THDVAR(thd, alter_print_error) != 0, false)) {
+            if (tables_have_same_keys(table, altered_table, get_tokudb_alter_print_error(thd) != 0, false)) {
                 handler_flags &= ~(Alter_inplace_info::ADD_INDEX + Alter_inplace_info::DROP_INDEX);
             }
         }
@@ -241,7 +241,7 @@ enum_alter_inplace_result ha_tokudb::check_if_supported_inplace_alter(TABLE *alt
     ctx->altered_table_kc_info = &ctx->altered_table_kc_info_base;
     memset(ctx->altered_table_kc_info, 0, sizeof (KEY_AND_COL_INFO));
 
-    if (get_disable_hot_alter(thd)) {
+    if (get_tokudb_disable_hot_alter(thd)) {
         ; // do nothing
     } else
     // add or drop index
@@ -249,7 +249,7 @@ enum_alter_inplace_result ha_tokudb::check_if_supported_inplace_alter(TABLE *alt
                    Alter_inplace_info::ADD_INDEX + Alter_inplace_info::ADD_UNIQUE_INDEX)) {
         if (table->s->null_bytes == altered_table->s->null_bytes && 
             (ha_alter_info->index_add_count > 0 || ha_alter_info->index_drop_count > 0) &&
-            !tables_have_same_keys(table, altered_table, THDVAR(thd, alter_print_error) != 0, false) &&
+            !tables_have_same_keys(table, altered_table, get_tokudb_alter_print_error(thd) != 0, false) &&
             is_disjoint_add_drop(ha_alter_info)) {
 
             if (ctx->handler_flags & (Alter_inplace_info::DROP_INDEX + Alter_inplace_info::DROP_UNIQUE_INDEX)) {
@@ -264,7 +264,7 @@ enum_alter_inplace_result ha_tokudb::check_if_supported_inplace_alter(TABLE *alt
                 if (ha_alter_info->index_add_count == 1 && ha_alter_info->index_drop_count == 0 &&  // only one add or drop
                     ctx->handler_flags == Alter_inplace_info::ADD_INDEX &&                          // must be add index not add unique index
                     thd_sql_command(thd) == SQLCOM_CREATE_INDEX &&                                  // must be a create index command
-                    get_create_index_online(thd)) {                                                 // must be enabled
+                    get_tokudb_create_index_online(thd)) {                                                 // must be enabled
                     // external_lock set WRITE_ALLOW_WRITE which allows writes concurrent with the index creation
                     result = HA_ALTER_INPLACE_NO_LOCK_AFTER_PREPARE; 
                 }
@@ -365,14 +365,14 @@ enum_alter_inplace_result ha_tokudb::check_if_supported_inplace_alter(TABLE *alt
         // alter auto_increment
         if (only_flags(create_info->used_fields, HA_CREATE_USED_AUTO)) {
             // do a sanity check that the table is what we think it is
-            if (tables_have_same_keys_and_columns(table, altered_table, THDVAR(thd, alter_print_error) != 0)) {
+            if (tables_have_same_keys_and_columns(table, altered_table, get_tokudb_alter_print_error(thd) != 0)) {
                 result = HA_ALTER_INPLACE_EXCLUSIVE_LOCK;
             }
         }
         // alter row_format
         else if (only_flags(create_info->used_fields, HA_CREATE_USED_ROW_FORMAT)) {
             // do a sanity check that the table is what we think it is
-            if (tables_have_same_keys_and_columns(table, altered_table, THDVAR(thd, alter_print_error) != 0)) {
+            if (tables_have_same_keys_and_columns(table, altered_table, get_tokudb_alter_print_error(thd) != 0)) {
                 result = HA_ALTER_INPLACE_EXCLUSIVE_LOCK;
             }
         }
@@ -391,7 +391,7 @@ enum_alter_inplace_result ha_tokudb::check_if_supported_inplace_alter(TABLE *alt
     }
 
     // turn a not supported result into an error if the slow alter table (copy) is disabled
-    if (result == HA_ALTER_INPLACE_NOT_SUPPORTED && get_disable_slow_alter(thd)) {
+    if (result == HA_ALTER_INPLACE_NOT_SUPPORTED && get_tokudb_disable_slow_alter(thd)) {
         print_error(HA_ERR_UNSUPPORTED, MYF(0));
         result = HA_ALTER_ERROR;
     }

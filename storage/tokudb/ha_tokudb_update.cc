@@ -215,7 +215,7 @@ int ha_tokudb::fast_update(THD *thd, List<Item> &update_fields, List<Item> &upda
 
 check_error:
     if (error != 0) {
-        if (THDVAR(thd, disable_slow_update) != 0)
+        if (get_tokudb_disable_slow_update(thd) != 0)
             error = HA_ERR_UNSUPPORTED;
         if (error != ENOTSUP)
             print_error(error, MYF(0));
@@ -812,7 +812,7 @@ int ha_tokudb::upsert(THD *thd, List<Item> &update_fields, List<Item> &update_va
 
 check_error:
     if (error != 0) {
-        if (THDVAR(thd, disable_slow_upsert) != 0)
+        if (get_tokudb_disable_slow_upsert(thd) != 0)
             error = HA_ERR_UNSUPPORTED;
         if (error != ENOTSUP)
             print_error(error, MYF(0));

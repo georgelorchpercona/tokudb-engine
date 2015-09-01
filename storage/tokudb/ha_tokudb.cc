@@ -319,7 +319,7 @@ static inline bool do_ignore_flag_optimization(THD* thd, TABLE* table, bool opt_
     bool do_opt = false;
     if (opt_eligible) {
         if (is_replace_into(thd) || is_insert_ignore(thd)) {
-            uint pk_insert_mode = get_pk_insert_mode(thd);
+            uint pk_insert_mode = get_tokudb_pk_insert_mode(thd);
             if ((!table->triggers && pk_insert_mode < 2) || pk_insert_mode == 0) {
                 if (mysql_bin_log.is_open() && thd->variables.binlog_format != BINLOG_FORMAT_STMT) {
                     do_opt = false;
@@ -3112,7 +3112,7 @@ bool ha_tokudb::may_table_be_empty(DB_TXN *txn) {
     DBC* tmp_cursor = NULL;
     DB_TXN* tmp_txn = NULL;
 
-    const int empty_scan = THDVAR(ha_thd(), empty_scan);
+    const int empty_scan = get_tokudb_empty_scan(ha_thd()); 
     if (empty_scan == TOKUDB_EMPTY_SCAN_DISABLED)
         goto cleanup;
 
@@ -3171,16 +3171,17 @@ void ha_tokudb::start_bulk_insert(ha_rows rows) {
     lock_count = 0;
     
     if ((rows == 0 || rows > 1) && share->try_table_lock) {
-        if (get_prelock_empty(thd) && may_table_be_empty(transaction) && transaction != NULL) {
+        if (get_tokudb_prelock_empty(thd) &&
+            may_table_be_empty(transaction) &&
+            transaction != NULL) {
             if (using_ignore || is_insert_ignore(thd) || thd->lex->duplicates != DUP_ERROR) {
                 acquire_table_lock(transaction, lock_write);
-            }
-            else {
+            } else {
                 mult_dbt_flags[primary_key] = 0;
                 if (!thd_test_options(thd, OPTION_RELAXED_UNIQUE_CHECKS) && !hidden_primary_key) {
                     mult_put_flags[primary_key] = DB_NOOVERWRITE;
                 }
-                uint32_t loader_flags = (get_load_save_space(thd)) ? 
+                uint32_t loader_flags = (get_tokudb_load_save_space(thd)) ? 
                     LOADER_COMPRESS_INTERMEDIATES : 0;
 
                 int error = db_env->create_loader(
@@ -3474,18 +3475,19 @@ cleanup:
 
 static void maybe_do_unique_checks_delay(THD *thd) {
     if (thd->slave_thread) {
-        uint64_t delay_ms = THDVAR(thd, rpl_unique_checks_delay);
+        uint64_t delay_ms = get_tokudb_rpl_unique_checks_delay(thd);
         if (delay_ms)
             usleep(delay_ms * 1000);
     }
 }
 
 static bool need_read_only(THD *thd) {
-    return opt_readonly || !THDVAR(thd, rpl_check_readonly);
+    return opt_readonly || get_tokudb_rpl_check_readonly(thd);
 }        
 
 static bool do_unique_checks(THD *thd, bool do_rpl_event) {
-    if (do_rpl_event && thd->slave_thread && need_read_only(thd) && !THDVAR(thd, rpl_unique_checks))
+    if (do_rpl_event && thd->slave_thread && need_read_only(thd) &&
+        get_tokudb_rpl_unique_checks(thd))
         return false;
     else
         return !thd_test_options(thd, OPTION_RELAXED_UNIQUE_CHECKS);
@@ -4309,7 +4311,7 @@ static bool tokudb_do_bulk_fetch(THD *thd) {
     case SQLCOM_INSERT_SELECT:
     case SQLCOM_REPLACE_SELECT:
     case SQLCOM_DELETE:
-        return THDVAR(thd, bulk_fetch) != 0;
+        return get_tokudb_bulk_fetch(thd) != 0;
     default:
         return false;
     }
@@ -4430,10 +4432,12 @@ int ha_tokudb::index_init(uint keynr, bool sorted) {
     if (use_write_locks) {
         cursor_flags |= DB_RMW;
     }
-    if (get_disable_prefetching(thd)) {
+    if (get_tokudb_disable_prefetching(thd)) {
         cursor_flags |= DBC_DISABLE_PREFETCHING;
     }
-    if ((error = share->key_file[keynr]->cursor(share->key_file[keynr], transaction, &cursor, cursor_flags))) {
+    if ((error = share->key_file[keynr]->cursor(share->key_file[keynr],
+                                                transaction, &cursor,
+                                                cursor_flags))) {
         if (error == TOKUDB_MVCC_DICTIONARY_TOO_NEW) {
             error = HA_ERR_TABLE_DEF_CHANGED;
             my_error(ER_TABLE_DEF_CHANGED, MYF(0));
@@ -5583,7 +5587,7 @@ int ha_tokudb::rnd_pos(uchar * buf, uchar * pos) {
     // test rpl slave by inducing a delay before the point query
     THD *thd = ha_thd();
     if (thd->slave_thread && (in_rpl_delete_rows || in_rpl_update_rows)) {
-        uint64_t delay_ms = THDVAR(thd, rpl_lookup_rows_delay);
+        uint64_t delay_ms = get_tokudb_rpl_lookup_rows_delay(thd);
         if (delay_ms)
             usleep(delay_ms * 1000);
     }
@@ -6287,7 +6291,7 @@ THR_LOCK_DATA **ha_tokudb::store_lock(THD * thd, THR_LOCK_DATA ** to, enum thr_l
     if (lock_type != TL_IGNORE && lock.type == TL_UNLOCK) {
         enum_sql_command sql_command = (enum_sql_command) thd_sql_command(thd);
         if (!thd->in_lock_tables) {
-            if (sql_command == SQLCOM_CREATE_INDEX && get_create_index_online(thd)) {
+            if (sql_command == SQLCOM_CREATE_INDEX && get_tokudb_create_index_online(thd)) {
                 // hot indexing
                 rw_rdlock(&share->num_DBs_lock);
                 if (share->num_DBs == (table->s->keys + tokudb_test(hidden_primary_key))) {
@@ -6413,7 +6417,8 @@ void ha_tokudb::update_create_info(HA_CREATE_INFO* create_info) {
         // show create table asks us to update this create_info, this makes it
         // so we'll always show what compression type we're using
         create_info->row_type = get_row_type();
-        if (create_info->row_type == ROW_TYPE_TOKU_ZLIB && THDVAR(ha_thd(), hide_default_row_format) != 0) {
+        if (create_info->row_type == ROW_TYPE_TOKU_ZLIB &&
+            get_tokudb_hide_default_row_format(ha_thd()) != 0) {
             create_info->row_type = ROW_TYPE_DEFAULT;
         }
     }
@@ -6763,7 +6768,7 @@ int ha_tokudb::create(const char *name, TABLE * form, HA_CREATE_INFO * create_in
 #else
     const srv_row_format_t row_format = (create_info->used_fields & HA_CREATE_USED_ROW_FORMAT)
         ? row_type_to_row_format(create_info->row_type)
-        : get_row_format(thd);
+        : get_tokudb_row_format(thd);
 #endif
     const toku_compression_method compression_method = row_format_to_toku_compression_method(row_format);
 
@@ -7438,7 +7443,7 @@ int ha_tokudb::tokudb_add_index(
     THD* thd = ha_thd();
     DB_LOADER* loader = NULL;
     DB_INDEXER* indexer = NULL;
-    bool loader_save_space = get_load_save_space(thd);
+    bool loader_save_space = get_tokudb_load_save_space(thd);
     bool use_hot_index = (lock.type == TL_WRITE_ALLOW_WRITE);
     uint32_t loader_flags = loader_save_space ? LOADER_COMPRESS_INTERMEDIATES : 0;
     uint32_t indexer_flags = 0;
@@ -8190,7 +8195,7 @@ bool ha_tokudb::rpl_lookup_rows() {
     if (!in_rpl_delete_rows && !in_rpl_update_rows)
         return true;
     else
-        return THDVAR(ha_thd(), rpl_lookup_rows);
+        return get_tokudb_rpl_lookup_rows(ha_thd());
 }
 
 // table admin 
@@ -8218,6 +8223,9 @@ bool ha_tokudb::rpl_lookup_rows() {
 
 // handlerton
 #include "hatoku_hton.cc"
+
+// sysvars
+#include "ha_tokudb_sysvars.cc"
 
 // generate template functions
 namespace tokudb {
