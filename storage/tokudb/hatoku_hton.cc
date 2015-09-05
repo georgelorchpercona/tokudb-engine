@@ -74,11 +74,6 @@ ha_create_table_option tokudb_index_options[] = {
 };
 #endif
 
-static uchar *tokudb_get_key(TOKUDB_SHARE * share, size_t * length, my_bool not_used __attribute__ ((unused))) {
-    *length = share->table_name_length;
-    return (uchar *) share->table_name;
-}
-
 static handler *tokudb_create_handler(handlerton * hton, TABLE_SHARE * table, MEM_ROOT * mem_root);
 
 
@@ -114,8 +109,6 @@ handlerton *tokudb_hton;
 
 const char *ha_tokudb_ext = ".tokudb";
 DB_ENV *db_env;
-HASH tokudb_open_tables;
-pthread_mutex_t tokudb_mutex;
 
 #if TOKU_THDVAR_MEMALLOC_BUG
 static pthread_mutex_t tokudb_map_mutex;
@@ -274,8 +267,7 @@ static int tokudb_init_func(void *p) {
         goto error;
     }
 
-    tokudb_pthread_mutex_init(&tokudb_mutex, MY_MUTEX_INIT_FAST);
-    (void) my_hash_init(&tokudb_open_tables, table_alias_charset, 32, 0, 0, (my_hash_get_key) tokudb_get_key, 0, 0);
+    TOKUDB_SHARE::static_init();
 
     tokudb_hton->state = SHOW_OPTION_YES;
     // tokudb_hton->flags= HTON_CAN_RECREATE;  // QQQ this came from skeleton
@@ -531,8 +523,6 @@ static int tokudb_done_func(void *p) {
     toku_global_status_variables = NULL;
     tokudb_my_free(toku_global_status_rows);
     toku_global_status_rows = NULL;
-    my_hash_free(&tokudb_open_tables);
-    tokudb_pthread_mutex_destroy(&tokudb_mutex);
     TOKUDB_DBUG_RETURN(0);
 }
 
@@ -550,6 +540,8 @@ int tokudb_end(handlerton * hton, ha_panic_function type) {
     // in isolation.
     rw_wrlock(&tokudb_hton_initialized_lock);
     assert(tokudb_hton_initialized);
+
+    TOKUDB_SHARE::static_destroy();
 
     if (db_env) {
         if (tokudb_init_flags & DB_INIT_LOG)

@@ -51,17 +51,80 @@ typedef struct loader_context {
 // Some of the variables here are the DB* pointers to indexes,
 // and auto increment information.
 //
+// When the last user releases it's reference on the share,
+// it closes all of its database handles and releases all info
+// The share instance stays around though so some data can be transiently
+// kept across open-close-open-close cycles. These data will be explicitly
+// noted below.
+//
 class TOKUDB_SHARE {
 public:
-    void init(void);
-    void destroy(void);
+    enum share_state_t {
+        CLOSED,
+        OPENING,
+        OPENED,
+        CLOSING,
+        ERROR
+    };
+
+    // Increases the ref count and waits for any currently executing state
+    // transition to complete. Returns current state and leaves share locked.
+    // Callers must check to ensure share is in correct state for callers use
+    // and unlock the share.
+    share_state_t addref(void);
+
+    // Decreases the ref count and potentially closes the share.
+    int release(void);
+
+    // Returns the current use count, no locking.
+    int use_count(void) const { return _use_count; }
+
+    // Locks the share.
+    inline void lock(void) { tokudb_pthread_mutex_lock(&_mutex); }
+
+    // Unlocks the share
+    inline void unlock(void) { tokudb_pthread_mutex_unlock(&_mutex); }
+
+    // Returns the current state of the share, no locking.
+    inline share_state_t state(void) const { return _state; }
+
+    // Sets the state of the share and potentially signals state transition
+    // waiters if there are any.
+    inline void set_state(share_state_t state) {
+        lock();
+        _state = state;
+        if (_use_count > 1 && (_state == TOKUDB_SHARE::OPENED ||
+            TOKUDB_SHARE::CLOSED || TOKUDB_SHARE::ERROR)) {
+            tokudb_pthread_cond_broadcast(&_openclose_cond);
+        }
+        unlock();
+    }
+
+    // One time, start up init
+    static void static_init(void);
+
+    // One time, shutdown destroy
+    static void static_destroy(void);
+
+    // Retuns a locked, properly reference counted share.
+    // Callers must check to ensure share is in correct state for callers use
+    // and unlock the share.
+    static TOKUDB_SHARE* get_share(const char *table_name,
+                                   TABLE_SHARE* table_share,
+                                   THR_LOCK_DATA *data);
+
+    // Removes a share entirely from the pool, call to rename/deleta a table
+    static void drop_share(const char* table_name);
 
 public:
+    //*********************************
+    // Spans open-close-open
     char *table_name;
-    uint table_name_length, use_count;
-    pthread_mutex_t mutex;
-    THR_LOCK lock;
+    uint table_name_length;
 
+
+    //*********************************
+    // Destroyed and recreated on open-close-open
     ulonglong auto_ident;
     ulonglong last_auto_increment, auto_inc_create_value;
     //
@@ -106,22 +169,42 @@ public:
     // we want the following optimization for bulk loads, if the table is empty, 
     // attempt to grab a table lock. emptiness check can be expensive, 
     // so we try it once for a table. After that, we keep this variable around 
-    // to tell us to not try it again. 
-    // 
-    bool try_table_lock; 
+    // to tell us to not try it again.
+    //
+    bool try_table_lock;
 
     bool has_unique_keys;
     bool replace_into_fast;
     rw_lock_t num_DBs_lock;
     uint32_t num_DBs;
 
-    pthread_cond_t m_openclose_cond;
-    enum { CLOSED, OPENING, OPENED, CLOSING, ERROR } m_state;
-    int m_error;
-    int m_initialize_count;
 
     uint n_rec_per_key;
     uint64_t *rec_per_key;
+private:
+    static HASH _open_tables;
+    static pthread_mutex_t _open_tables_mutex;
+
+    static uchar* hash_get_key(TOKUDB_SHARE* share,
+                               size_t* length,
+                               my_bool not_used __attribute__ ((unused)));
+
+    static void hash_free_element(TOKUDB_SHARE* share);
+
+    //*********************************
+    // Spans open-close-open
+    pthread_mutex_t _mutex;
+    uint _use_count;
+
+    pthread_cond_t _openclose_cond;
+    share_state_t _state;
+
+    //*********************************
+    // Destroyed and recreated on open-close-open
+    THR_LOCK _thr_lock;
+
+    void init(void);
+    void destroy(void);
 };
 
 typedef struct st_filter_key_part_info {
@@ -540,10 +623,10 @@ public:
     int get_status(DB_TXN* trans);
     void init_hidden_prim_key_info(DB_TXN *txn);
     inline void get_auto_primary_key(uchar * to) {
-        tokudb_pthread_mutex_lock(&share->mutex);
+        share->lock();
         share->auto_ident++;
         hpk_num_to_char(to, share->auto_ident);
-        tokudb_pthread_mutex_unlock(&share->mutex);
+        share->unlock();
     }
     virtual void get_auto_increment(ulonglong offset, ulonglong increment, ulonglong nb_desired_values, ulonglong * first_value, ulonglong * nb_reserved_values);
     bool is_optimize_blocking();

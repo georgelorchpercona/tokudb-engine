@@ -76,6 +76,9 @@ static inline uint get_key_parts(const KEY *key);
 #include "hatoku_hton.h"
 #include <mysql/plugin.h>
 
+HASH TOKUDB_SHARE::_open_tables;
+pthread_mutex_t TOKUDB_SHARE::_open_tables_mutex;
+
 static const char *ha_tokudb_exts[] = {
     ha_tokudb_ext,
     NullS
@@ -163,31 +166,55 @@ static void free_key_and_col_info (KEY_AND_COL_INFO* kc_info) {
     kc_info->blob_fields = NULL;
 }
 
+uchar* TOKUDB_SHARE::hash_get_key(TOKUDB_SHARE* share, size_t* length,
+                                  my_bool not_used __attribute__ ((unused))) {
+    *length = share->table_name_length;
+    return (uchar *) share->table_name;
+}
+
+void TOKUDB_SHARE::hash_free_element(TOKUDB_SHARE* share) {
+    share->destroy();
+    tokudb_my_free((uchar *) share);
+}
+
+void TOKUDB_SHARE::static_init(void) {
+    tokudb_pthread_mutex_init(&_open_tables_mutex, MY_MUTEX_INIT_FAST);
+    (void) my_hash_init(&_open_tables, table_alias_charset, 32, 0, 0,
+                        (my_hash_get_key) hash_get_key,
+                        (my_hash_free_key) hash_free_element, 0);
+}
+
+void TOKUDB_SHARE::static_destroy(void) {
+    my_hash_free(&_open_tables);
+    tokudb_pthread_mutex_destroy(&_open_tables_mutex);
+}
+
 void TOKUDB_SHARE::init(void) {
-    use_count = 0;
-    thr_lock_init(&lock);
-    tokudb_pthread_mutex_init(&mutex, MY_MUTEX_INIT_FAST);
+    _use_count = 0;
+    thr_lock_init(&_thr_lock);
+    tokudb_pthread_mutex_init(&_mutex, MY_MUTEX_INIT_FAST);
     my_rwlock_init(&num_DBs_lock, 0);
-    tokudb_pthread_cond_init(&m_openclose_cond, NULL);
-    m_state = CLOSED;
+    tokudb_pthread_cond_init(&_openclose_cond, NULL);
+    _state = CLOSED;
 }
 
 void TOKUDB_SHARE::destroy(void) {
-    assert(m_state == CLOSED);
-    thr_lock_delete(&lock);
-    tokudb_pthread_mutex_destroy(&mutex);
+    assert(_use_count == 0);
+    assert(_state == TOKUDB_SHARE::CLOSED || _state == TOKUDB_SHARE::ERROR);
+    thr_lock_delete(&_thr_lock);
+    tokudb_pthread_mutex_destroy(&_mutex);
     rwlock_destroy(&num_DBs_lock);
-    tokudb_pthread_cond_destroy(&m_openclose_cond);
-    tokudb_my_free(rec_per_key);
-    rec_per_key = NULL;
+    tokudb_pthread_cond_destroy(&_openclose_cond);
 }
 
-// MUST have tokudb_mutex locked on input    
-static TOKUDB_SHARE *get_share(const char *table_name, TABLE_SHARE* table_share) {
+TOKUDB_SHARE* TOKUDB_SHARE::get_share(const char *table_name,
+                                      TABLE_SHARE* table_share,
+                                      THR_LOCK_DATA *data) {
+    tokudb_pthread_mutex_lock(&_open_tables_mutex);
     TOKUDB_SHARE *share = NULL;
     int error = 0;
     uint length = (uint) strlen(table_name);
-    if (!(share = (TOKUDB_SHARE *) my_hash_search(&tokudb_open_tables, (uchar *) table_name, length))) {
+    if (!(share = (TOKUDB_SHARE *) my_hash_search(&_open_tables, (uchar *) table_name, length))) {
         char *tmp_name;
 
         // create share and fill it with all zeroes
@@ -195,8 +222,7 @@ static TOKUDB_SHARE *get_share(const char *table_name, TABLE_SHARE* table_share)
         share = (TOKUDB_SHARE *) tokudb_my_multi_malloc(MYF(MY_WME | MY_ZEROFILL), 
             &share, sizeof(*share),
             &tmp_name, length + 1, 
-            NullS
-            );
+            NullS);
         assert(share);
 
         share->init();
@@ -205,76 +231,112 @@ static TOKUDB_SHARE *get_share(const char *table_name, TABLE_SHARE* table_share)
         share->table_name = tmp_name;
         strmov(share->table_name, table_name);
 
-        error = my_hash_insert(&tokudb_open_tables, (uchar *) share);
+        error = my_hash_insert(&_open_tables, (uchar *) share);
         if (error) {
             free_key_and_col_info(&share->kc_info);
+            share->destroy();
+            tokudb_my_free((uchar *) share);
+            share = NULL;
             goto exit;
         }
     }
 
+    share->addref();
+
+    if (data)
+        thr_lock_data_init(&(share->_thr_lock), data, NULL);
+
 exit:
-    if (error) {
-        share->destroy();
-        tokudb_my_free((uchar *) share);
-        share = NULL;
-    }
+    tokudb_pthread_mutex_unlock(&_open_tables_mutex);
     return share;
 }
 
-static int free_share(TOKUDB_SHARE * share) {
+void TOKUDB_SHARE::drop_share(const char* table_name) {
+    tokudb_pthread_mutex_lock(&_open_tables_mutex);
+
+    TOKUDB_SHARE *share = NULL;
+    uint length = (uint) strlen(table_name);
+    if ((share = (TOKUDB_SHARE *) my_hash_search(&_open_tables, (uchar *) table_name, length))) {
+        my_hash_delete(&_open_tables, (uchar *) share);
+        tokudb_pthread_mutex_unlock(&_open_tables_mutex);
+    } else {
+        tokudb_pthread_mutex_unlock(&_open_tables_mutex);
+    }
+}
+
+TOKUDB_SHARE::share_state_t TOKUDB_SHARE::addref(void) {
+    tokudb_pthread_mutex_lock(&_mutex);
+    _use_count++;
+
+    DBUG_PRINT("info", ("0x%p share->_use_count %u", this, _use_count));
+
+    if (_state == TOKUDB_SHARE::CLOSING) {
+        tokudb_pthread_cond_wait(&_openclose_cond, &_mutex);
+    }
+
+    if (_state == TOKUDB_SHARE::CLOSED || _state == TOKUDB_SHARE::ERROR) {
+        // reciever of this instance is responsible for opening and
+        // migrating the state to either OPENED or CLOSED
+        _state = TOKUDB_SHARE::OPENING;
+    } else {
+        while (_state == TOKUDB_SHARE::OPENING) {
+            tokudb_pthread_cond_wait(&_openclose_cond, &_mutex);
+        }
+    }
+
+    return _state;
+}
+
+int TOKUDB_SHARE::release(void) {
     int error, result = 0;
 
-    tokudb_pthread_mutex_lock(&share->mutex);
-    DBUG_PRINT("info", ("share->use_count %u", share->use_count));
-    if (!--share->use_count) {
-        share->m_state = TOKUDB_SHARE::CLOSING;
-        tokudb_pthread_mutex_unlock(&share->mutex);
+    tokudb_pthread_mutex_lock(&_mutex);
+    assert(_use_count != 0);
+    _use_count--;
+    DBUG_PRINT("info", ("0x%p share->_use_count %u", this, _use_count));
+    if (_use_count == 0) {
+        _state = TOKUDB_SHARE::CLOSING;
+        tokudb_pthread_mutex_unlock(&_mutex);
 
         //
         // number of open DB's may not be equal to number of keys we have because add_index
         // may have added some. So, we loop through entire array and close any non-NULL value
         // It is imperative that we reset a DB to NULL once we are done with it.
         //
-        for (uint i = 0; i < sizeof(share->key_file)/sizeof(share->key_file[0]); i++) {
-            if (share->key_file[i]) { 
+        for (uint i = 0; i < sizeof(key_file)/sizeof(key_file[0]); i++) {
+            if (key_file[i]) {
                 if (tokudb_debug & TOKUDB_DEBUG_OPEN) {
-                    TOKUDB_TRACE("dbclose:%p", share->key_file[i]);
+                    TOKUDB_TRACE("dbclose:%p", key_file[i]);
                 }
-                error = share->key_file[i]->close(share->key_file[i], 0);
+                error = key_file[i]->close(key_file[i], 0);
                 assert(error == 0);
                 if (error) {
                     result = error;
                 }
-                if (share->key_file[i] == share->file)
-                    share->file = NULL;
-                share->key_file[i] = NULL;
+                if (key_file[i] == file)
+                    file = NULL;
+                key_file[i] = NULL;
             }
         }
 
-        error = tokudb::close_status(&share->status_block);
+        error = tokudb::close_status(&status_block);
         assert(error == 0);
 
-        free_key_and_col_info(&share->kc_info);
+        free_key_and_col_info(&kc_info);
 
-        tokudb_pthread_mutex_lock(&tokudb_mutex);
-        tokudb_pthread_mutex_lock(&share->mutex);
-        share->m_state = TOKUDB_SHARE::CLOSED;
-        if (share->use_count > 0) {
-            tokudb_pthread_cond_broadcast(&share->m_openclose_cond);
-            tokudb_pthread_mutex_unlock(&share->mutex);
-            tokudb_pthread_mutex_unlock(&tokudb_mutex);
-        } else {
-
-            my_hash_delete(&tokudb_open_tables, (uchar *) share);
-            
-            tokudb_pthread_mutex_unlock(&share->mutex);
-            tokudb_pthread_mutex_unlock(&tokudb_mutex);
-
-            share->destroy();
-            tokudb_my_free((uchar *) share);
+        if (rec_per_key) {
+            tokudb_my_free(rec_per_key);
+            rec_per_key = NULL;
         }
+
+        tokudb_pthread_mutex_lock(&_mutex);
+        _state = TOKUDB_SHARE::CLOSED;
+        if (_use_count > 0) {
+            tokudb_pthread_cond_broadcast(&_openclose_cond);
+        }
+        tokudb_pthread_mutex_unlock(&_mutex);
     } else {
-        tokudb_pthread_mutex_unlock(&share->mutex);
+        tokudb_pthread_mutex_unlock(&_mutex);
     }
 
     return result;
@@ -1544,8 +1606,6 @@ int ha_tokudb::initialize_share(const char* name, int mode) {
         if (error) { goto exit; }
     }
 
-    DBUG_PRINT("info", ("share->use_count %u", share->use_count));
-    share->m_initialize_count++;
 
     error = get_status(txn);
     if (error) {
@@ -1759,51 +1819,40 @@ int ha_tokudb::open(const char *name, int mode, uint test_if_locked) {
     }
 
     // lookup or create share
-    tokudb_pthread_mutex_lock(&tokudb_mutex);
-    share = get_share(name, table_share);
+    share = TOKUDB_SHARE::get_share(name, table_share, &lock);
     assert(share);
 
-    thr_lock_data_init(&share->lock, &lock, NULL);
-
-    tokudb_pthread_mutex_lock(&share->mutex);
-    tokudb_pthread_mutex_unlock(&tokudb_mutex);
-    share->use_count++;
-    while (share->m_state == TOKUDB_SHARE::OPENING || share->m_state == TOKUDB_SHARE::CLOSING) {
-        tokudb_pthread_cond_wait(&share->m_openclose_cond, &share->mutex);
-    }
-    if (share->m_state == TOKUDB_SHARE::CLOSED) {
-        share->m_state = TOKUDB_SHARE::OPENING;
-        tokudb_pthread_mutex_unlock(&share->mutex);
+    if (share->state() == TOKUDB_SHARE::OPENING) {
+        // means we're responsible for the transition to OPENED, ERROR or CLOSED
+        share->unlock();
 
         ret_val = allocate_key_and_col_info(table_share, &share->kc_info);
         if (ret_val == 0) {
             ret_val = initialize_share(name, mode);
         }
 
-        tokudb_pthread_mutex_lock(&share->mutex);
         if (ret_val == 0) {
-            share->m_state = TOKUDB_SHARE::OPENED;
+            share->set_state(TOKUDB_SHARE::OPENED);
         } else {
-            share->m_state = TOKUDB_SHARE::ERROR;
-            share->m_error = ret_val;
+            share->set_state(TOKUDB_SHARE::ERROR);
         }
-        tokudb_pthread_cond_broadcast(&share->m_openclose_cond);
-    }
-    if (share->m_state == TOKUDB_SHARE::ERROR) {
-        ret_val = share->m_error;
-        tokudb_pthread_mutex_unlock(&share->mutex);
-        free_share(share);
-        goto exit;
     } else {
-        assert(share->m_state == TOKUDB_SHARE::OPENED);
-        tokudb_pthread_mutex_unlock(&share->mutex);
+        // got an already OPENED instance
+        share->unlock();
     }
+
+    if (share->state() == TOKUDB_SHARE::ERROR) {
+        share->release();
+        goto exit;
+    }
+
+    assert(share->state() == TOKUDB_SHARE::OPENED);
 
     ref_length = share->ref_length;     // If second open
     
     if (tokudb_debug & TOKUDB_DEBUG_OPEN) {
         TOKUDB_HANDLER_TRACE("tokudbopen:%p:share=%p:file=%p:table=%p:table->s=%p:%d", 
-                     this, share, share->file, table, table->s, share->use_count);
+                     this, share, share->file, table, table->s, share->use_count());
     }
 
     key_read = false;
@@ -2108,7 +2157,7 @@ int ha_tokudb::__close() {
     rec_update_buff = NULL;
     alloc_ptr = NULL;
     ha_tokudb::reset();
-    int retval = free_share(share);
+    int retval = share->release();
     TOKUDB_HANDLER_DBUG_RETURN(retval);
 }
 
@@ -3213,9 +3262,9 @@ void ha_tokudb::start_bulk_insert(ha_rows rows) {
             }
         }
     exit_try_table_lock:
-        tokudb_pthread_mutex_lock(&share->mutex);
+        share->lock();
         share->try_table_lock = false;
-        tokudb_pthread_mutex_unlock(&share->mutex);
+        share->unlock();
     }
     TOKUDB_HANDLER_DBUG_VOID_RETURN;
 }
@@ -3232,9 +3281,9 @@ int ha_tokudb::end_bulk_insert(bool abort) {
     tokudb_trx_data* trx = (tokudb_trx_data *) thd_get_ha_data(thd, tokudb_hton);
     bool using_loader = (loader != NULL);
     if (ai_metadata_update_required) {
-        tokudb_pthread_mutex_lock(&share->mutex);
+        share->lock();
         error = update_max_auto_inc(share->status_block, share->last_auto_increment);
-        tokudb_pthread_mutex_unlock(&share->mutex);
+        share->unlock();
         if (error) { goto cleanup; }
     }
     delay_updating_ai_metadata = false;
@@ -3808,7 +3857,7 @@ int ha_tokudb::write_row(uchar * record) {
     // of the auto inc field.
     //
     if (share->has_auto_inc && record == table->record[0]) {
-        tokudb_pthread_mutex_lock(&share->mutex);
+        share->lock();
         ulonglong curr_auto_inc = retrieve_auto_increment(
             table->field[share->ai_field_index]->key_type(), field_offset(table->field[share->ai_field_index], table), record);
         if (curr_auto_inc > share->last_auto_increment) {
@@ -3820,7 +3869,7 @@ int ha_tokudb::write_row(uchar * record) {
                 update_max_auto_inc(share->status_block, share->last_auto_increment);
             }
         }
-        tokudb_pthread_mutex_unlock(&share->mutex);
+        share->unlock();
     }
 
     //
@@ -3991,7 +4040,7 @@ int ha_tokudb::update_row(const uchar * old_row, uchar * new_row) {
     // of the auto inc field.
     //
     if (share->has_auto_inc && new_row == table->record[0]) {
-        tokudb_pthread_mutex_lock(&share->mutex);
+        share->lock();
         ulonglong curr_auto_inc = retrieve_auto_increment(
             table->field[share->ai_field_index]->key_type(), 
             field_offset(table->field[share->ai_field_index], table),
@@ -4003,7 +4052,7 @@ int ha_tokudb::update_row(const uchar * old_row, uchar * new_row) {
                 share->last_auto_increment = curr_auto_inc;
             }
         }
-        tokudb_pthread_mutex_unlock(&share->mutex);
+        share->unlock();
     }
 
     //
@@ -6132,7 +6181,7 @@ int ha_tokudb::external_lock(THD * thd, int lock_type) {
         trx->tokudb_lock_count++;
     }
     else {
-        tokudb_pthread_mutex_lock(&share->mutex);
+        share->lock();
         // hate dealing with comparison of signed vs unsigned, so doing this
         if (deleted_rows > added_rows && share->rows < (deleted_rows - added_rows)) {
             share->rows = 0;
@@ -6140,7 +6189,7 @@ int ha_tokudb::external_lock(THD * thd, int lock_type) {
         else {
             share->rows += (added_rows - deleted_rows);
         }
-        tokudb_pthread_mutex_unlock(&share->mutex);
+        share->unlock();
         added_rows = 0;
         deleted_rows = 0;
         share->rows_from_locked_table = 0;
@@ -7087,6 +7136,7 @@ int ha_tokudb::delete_table(const char *name) {
 another transaction has accessed the table. \
 To drop the table, make sure no transactions touch the table.", name);
     }
+    TOKUDB_SHARE::drop_share(name);
     TOKUDB_HANDLER_DBUG_RETURN(error);
 }
 
@@ -7109,6 +7159,7 @@ int ha_tokudb::rename_table(const char *from, const char *to) {
 another transaction has accessed the table. \
 To rename the table, make sure no transactions touch the table.", from, to);
     }
+    TOKUDB_SHARE::drop_share(from);
     TOKUDB_HANDLER_DBUG_RETURN(error);
 }
 
@@ -7366,7 +7417,7 @@ void ha_tokudb::get_auto_increment(ulonglong offset, ulonglong increment, ulongl
     ulonglong nr;
     bool over;
 
-    tokudb_pthread_mutex_lock(&share->mutex);
+    share->lock();
 
     if (share->auto_inc_create_value > share->last_auto_increment) {
         nr = share->auto_inc_create_value;
@@ -7395,7 +7446,7 @@ void ha_tokudb::get_auto_increment(ulonglong offset, ulonglong increment, ulongl
     }
     *first_value = nr;
     *nb_reserved_values = nb_desired_values;
-    tokudb_pthread_mutex_unlock(&share->mutex);
+    share->unlock();
     TOKUDB_HANDLER_DBUG_VOID_RETURN;
 }
 
@@ -7748,22 +7799,20 @@ int ha_tokudb::tokudb_add_index(
         }
     }
 
+    share->lock();
     //
     // We have an accurate row count, might as well update share->rows
     //
     if(!creating_hot_index) {
-        tokudb_pthread_mutex_lock(&share->mutex);
         share->rows = num_processed;
-        tokudb_pthread_mutex_unlock(&share->mutex);
     }
     //
     // now write stuff to status.tokudb
     //
-    tokudb_pthread_mutex_lock(&share->mutex);
     for (uint i = 0; i < num_of_keys; i++) {
         write_key_name_to_status(share->status_block, key_info[i].name, txn);
     }
-    tokudb_pthread_mutex_unlock(&share->mutex);
+    share->unlock();
     
     error = 0;
 cleanup:
